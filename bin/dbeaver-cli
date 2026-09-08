@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# dbeaver-cli - curl wrapper for the DBeaver REST API server plugin
+#
+# Reads the bearer token from the DBeaver metadata folder and calls the
+# REST endpoints exposed by the org.jkiss.dbeaver.rest.server plugin.
+#
+# Environment:
+#   DBEAVER_REST_URL   - server base URL  (default: http://localhost:17840/api)
+#   DBEAVER_WORKSPACE  - DBeaver workspace folder
+#                        (default: ~/Library/DBeaverData/workspace6)
+#   DBEAVER_REST_TOKEN - bearer token (overrides token from the config file)
+#   DBEAVER_REST_TIMEOUT - per-request timeout in seconds (default: 600)
+set -euo pipefail
+
+BASE_URL="${DBEAVER_REST_URL:-http://localhost:17840/api}"
+WORKSPACE="${DBEAVER_WORKSPACE:-$HOME/Library/DBeaverData/workspace6}"
+CONFIG_FILE="$WORKSPACE/.metadata/dbeaver-rest-server.properties"
+
+if [[ -z "${DBEAVER_REST_TOKEN:-}" ]]; then
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "Config file not found: $CONFIG_FILE" >&2
+        echo "Start DBeaver with the REST server plugin, or set DBEAVER_REST_TOKEN / DBEAVER_WORKSPACE." >&2
+        exit 1
+    fi
+    DBEAVER_REST_TOKEN="$(sed -n 's/^token=//p' "$CONFIG_FILE")"
+fi
+
+usage() {
+    cat <<USAGE
+Usage: dbeaver-cli <command> [args]
+
+Commands:
+  version                        Show DBeaver product info
+  datasources [--json]           List connections as a table (name, driver, status, id);
+                                 --json prints the raw API response
+  connect <id-or-name>           Connect a data source
+  disconnect <id-or-name>        Disconnect a data source
+  sql <id-or-name> <sql> [rows]      Execute SQL, print result as a table (default maxRows=1000)
+  sql <id-or-name> -f <file> [rows]  Execute SQL read from a file
+  sql <id-or-name> - [rows]          Execute SQL read from stdin
+  (append --json to any sql form for the raw API response)
+
+Examples:
+  dbeaver-cli datasources
+  dbeaver-cli sql my-postgres "select * from actor limit 5"
+  dbeaver-cli sql my-postgres -f report.sql 500
+  cat report.sql | dbeaver-cli sql my-postgres -
+USAGE
+    exit 1
+}
+
+TIMEOUT="${DBEAVER_REST_TIMEOUT:-600}"
+
+api() {
+    local method="$1" path="$2" body="${3:-}"
+    local out rc=0
+    if [[ -n "$body" ]]; then
+        out=$(curl -sf --max-time "$TIMEOUT" -X "$method" -H "Authorization: Bearer $DBEAVER_REST_TOKEN" \
+            -H "Content-Type: application/json" -d "$body" "$BASE_URL$path") || rc=$?
+    else
+        out=$(curl -sf --max-time "$TIMEOUT" -X "$method" -H "Authorization: Bearer $DBEAVER_REST_TOKEN" "$BASE_URL$path") || rc=$?
+    fi
+    case $rc in
+        0)
+            printf '%s\n' "$out"
+            ;;
+        28)
+            echo "Error: server did not respond within ${TIMEOUT}s." >&2
+            echo "The query may still be running in DBeaver; retry, or raise DBEAVER_REST_TIMEOUT." >&2
+            exit 1
+            ;;
+        22)
+            echo "Error: HTTP request failed (is DBeaver running? is the token valid?)." >&2
+            exit 1
+            ;;
+        *)
+            echo "Error: request failed (curl exit $rc)." >&2
+            exit 1
+            ;;
+    esac
+}
+
+json_escape() {
+    python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"
+}
+
+[[ $# -lt 1 ]] && usage
+
+case "$1" in
+    version)
+        api GET /version
+        ;;
+    datasources)
+        if [[ "${2:-}" == "--json" ]]; then
+            api GET /datasources
+        else
+            resp="$(api GET /datasources)"
+            printf '%s\n' "$resp" | python3 -c '
+import json, sys
+dss = json.load(sys.stdin)
+# url intentionally omitted: it can embed credentials/tokens
+headers = ("NAME", "DRIVER", "STATUS", "ID")
+rows = [[d.get("name") or "", d.get("driver") or "",
+         "connected" if d.get("connected") else "offline", d.get("id") or ""] for d in dss]
+widths = [max(len(r[i]) for r in rows + [list(headers)]) for i in range(len(headers))]
+fmt = "  ".join("{:<%d}" % w for w in widths)
+print(fmt.format(*headers))
+print(fmt.format(*["-" * w for w in widths]))
+for r in rows:
+    print(fmt.format(*r))
+'
+        fi
+        ;;
+    connect|disconnect)
+        [[ $# -lt 2 ]] && usage
+        api POST "/datasources/$2/$1"
+        ;;
+    sql)
+        [[ $# -lt 3 ]] && usage
+        raw=0
+        if [[ "${!#}" == "--json" ]]; then
+            raw=1
+            set -- "${@:1:$(($#-1))}"
+        fi
+        sql_text=""
+        max_rows=""
+        case "$3" in
+            -f|--file)
+                [[ $# -lt 4 ]] && usage
+                [[ -f "$4" ]] || { echo "SQL file not found: $4" >&2; exit 1; }
+                sql_text="$(cat "$4")"
+                max_rows="${5:-1000}"
+                ;;
+            -)
+                sql_text="$(cat)"
+                max_rows="${4:-1000}"
+                ;;
+            *)
+                sql_text="$3"
+                max_rows="${4:-1000}"
+                ;;
+        esac
+        echo "Executing on $2 (timeout ${TIMEOUT}s, cold engines like DLC/Spark may take minutes)..." >&2
+        body="{\"dataSource\": $(json_escape "$2"), \"sql\": $(json_escape "$sql_text"), \"maxRows\": $max_rows}"
+        if [[ "$raw" == "1" ]]; then
+            api POST /sql/execute "$body"
+        else
+            resp="$(api POST /sql/execute "$body")"
+            printf '%s\n' "$resp" | python3 -c '
+import json, sys
+
+MAX_CELL = 50
+
+def fmt_cell(v):
+    if v is None:
+        return "NULL"
+    v = str(v).replace("\r", " ").replace("\n", "\\n")
+    return v if len(v) <= MAX_CELL else v[:MAX_CELL - 1] + "\u2026"
+
+r = json.load(sys.stdin)
+if not r.get("hasResultSet"):
+    print("OK, %s row(s) affected" % (r.get("updateCount") if r.get("updateCount") is not None else "?"))
+    sys.exit(0)
+cols = [c["name"] for c in r.get("columns") or []]
+rows = [[fmt_cell(v) for v in row] for row in r.get("rows") or []]
+if not cols:
+    print("(empty result)")
+    sys.exit(0)
+widths = [max([len(cols[i])] + [len(row[i]) for row in rows]) for i in range(len(cols))]
+fmt = "  ".join("{:<%d}" % w for w in widths)
+print(fmt.format(*cols))
+print(fmt.format(*["-" * w for w in widths]))
+for row in rows:
+    print(fmt.format(*row))
+note = "(%d row(s)%s)" % (len(rows), ", TRUNCATED at maxRows" if r.get("truncated") else "")
+print(note)
+'
+        fi
+        ;;
+    *)
+        usage
+        ;;
+esac

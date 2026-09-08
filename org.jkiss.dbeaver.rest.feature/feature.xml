@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feature
+        id="org.jkiss.dbeaver.rest.feature"
+        label="DBeaver REST API Server"
+        version="1.0.0.qualifier"
+        provider-name="DBeaver Corp">
+
+    <description>
+        Embeds a REST API server into DBeaver CE so that datasources and SQL
+        execution can be controlled remotely (e.g. with curl).
+    </description>
+
+    <copyright>DBeaver Corp and others</copyright>
+
+    <plugin id="org.jkiss.dbeaver.rest.server" version="0.0.0"/>
+</feature>

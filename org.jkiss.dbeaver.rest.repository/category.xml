@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<site>
+    <description name="DBeaver - REST API server">DBeaver - REST API server update site</description>
+
+    <feature id="org.jkiss.dbeaver.rest.feature">
+        <category name="org.jkiss.dbeaver.rest.category"/>
+    </feature>
+    <category-def name="org.jkiss.dbeaver.rest.category" label="DBeaver REST API Server"/>
+</site>

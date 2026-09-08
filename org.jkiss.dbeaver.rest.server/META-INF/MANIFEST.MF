@@ -1,0 +1,14 @@
+Manifest-Version: 1.0
+Bundle-ManifestVersion: 2
+Bundle-Vendor: DBeaver Corp
+Bundle-Name: DBeaver REST API Server
+Bundle-SymbolicName: org.jkiss.dbeaver.rest.server;singleton:=true
+Bundle-Version: 1.0.0.qualifier
+Bundle-Release-Date: 20260904
+Bundle-RequiredExecutionEnvironment: JavaSE-21
+Bundle-ActivationPolicy: lazy
+Bundle-Activator: org.jkiss.dbeaver.rest.server.RestServerPlugin
+Require-Bundle: org.jkiss.dbeaver.model;visibility:=reexport,
+ org.eclipse.ui,
+ com.google.gson
+Automatic-Module-Name: org.jkiss.dbeaver.rest.server
