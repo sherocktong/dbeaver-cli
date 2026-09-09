@@ -53,31 +53,57 @@ TIMEOUT="${DBEAVER_REST_TIMEOUT:-600}"
 
 api() {
     local method="$1" path="$2" body="${3:-}"
-    local out rc=0
+    local out http_code curl_rc=0
     if [[ -n "$body" ]]; then
-        out=$(curl -sf --max-time "$TIMEOUT" -X "$method" -H "Authorization: Bearer $DBEAVER_REST_TOKEN" \
-            -H "Content-Type: application/json" -d "$body" "$BASE_URL$path") || rc=$?
+        # Append the status code after a separator line so error bodies stay readable
+        out=$(curl -sS --max-time "$TIMEOUT" -X "$method" -H "Authorization: Bearer $DBEAVER_REST_TOKEN" \
+            -H "Content-Type: application/json" -d "$body" -w $'\n%{http_code}' "$BASE_URL$path") || curl_rc=$?
     else
-        out=$(curl -sf --max-time "$TIMEOUT" -X "$method" -H "Authorization: Bearer $DBEAVER_REST_TOKEN" "$BASE_URL$path") || rc=$?
+        out=$(curl -sS --max-time "$TIMEOUT" -X "$method" -H "Authorization: Bearer $DBEAVER_REST_TOKEN" \
+            -w $'\n%{http_code}' "$BASE_URL$path") || curl_rc=$?
     fi
-    case $rc in
+    case $curl_rc in
         0)
-            printf '%s\n' "$out"
+            http_code="${out##*$'\n'}"
+            out="${out%$'\n'*}"
+            if [[ "$http_code" == 2* ]]; then
+                printf '%s\n' "$out"
+                return 0
+            fi
+            echo "Error: $(api_error_message "$out" "HTTP $http_code")" >&2
+            exit 1
             ;;
         28)
             echo "Error: server did not respond within ${TIMEOUT}s." >&2
             echo "The query may still be running in DBeaver; retry, or raise DBEAVER_REST_TIMEOUT." >&2
             exit 1
             ;;
-        22)
-            echo "Error: HTTP request failed (is DBeaver running? is the token valid?)." >&2
-            exit 1
-            ;;
         *)
-            echo "Error: request failed (curl exit $rc)." >&2
+            echo "Error: request failed (curl exit $curl_rc)." >&2
             exit 1
             ;;
     esac
+}
+
+# Extract the "error" field from a JSON error body; fall back to the raw body.
+# JDBC drivers often embed a full Java stack trace in the error message — drop those lines.
+api_error_message() {
+    python3 -c '
+import json, re, sys
+body, fallback = sys.argv[1], sys.argv[2]
+msg = None
+try:
+    error = json.loads(body).get("error")
+    if error:
+        msg = error
+except ValueError:
+    pass
+if msg is None:
+    msg = body.strip() or fallback
+lines = [l for l in msg.splitlines()
+         if not re.match(r"^\s+at\s+[\w.$/]+\(", l) and not re.match(r"^\s*\.\.\.\s*\d+ more$", l)]
+print("\n".join(lines))
+' "$1" "$2"
 }
 
 json_escape() {
@@ -97,7 +123,14 @@ case "$1" in
             resp="$(api GET /datasources)"
             printf '%s\n' "$resp" | python3 -c '
 import json, sys
-dss = json.load(sys.stdin)
+try:
+    dss = json.load(sys.stdin)
+except ValueError as e:
+    print("Error: server returned a non-JSON response (%s)." % e, file=sys.stderr)
+    sys.exit(1)
+if isinstance(dss, dict) and dss.get("error"):
+    print("Error: %s" % dss["error"], file=sys.stderr)
+    sys.exit(1)
 # url intentionally omitted: it can embed credentials/tokens
 headers = ("NAME", "DRIVER", "STATUS", "ID")
 rows = [[d.get("name") or "", d.get("driver") or "",
@@ -157,7 +190,14 @@ def fmt_cell(v):
     v = str(v).replace("\r", " ").replace("\n", "\\n")
     return v if len(v) <= MAX_CELL else v[:MAX_CELL - 1] + "\u2026"
 
-r = json.load(sys.stdin)
+try:
+    r = json.load(sys.stdin)
+except ValueError as e:
+    print("Error: server returned a non-JSON response (%s). Use --json to inspect the raw output." % e, file=sys.stderr)
+    sys.exit(1)
+if isinstance(r, dict) and r.get("error"):
+    print("Error: %s" % r["error"], file=sys.stderr)
+    sys.exit(1)
 if not r.get("hasResultSet"):
     print("OK, %s row(s) affected" % (r.get("updateCount") if r.get("updateCount") is not None else "?"))
     sys.exit(0)
