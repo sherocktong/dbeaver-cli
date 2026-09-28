@@ -37,25 +37,6 @@ dbeaver-cli sql <id-or-name> - [rows]            # SQL from stdin
 `<id-or-name>` accepts either the connection id or its display name
 (e.g. `cp-tc-prod`). `sql` auto-connects the data source if it is not connected.
 
-## Latency and timeouts
-
-Queries are executed synchronously by DBeaver and the CLI waits for the full
-result. Cold query engines are SLOW: Tencent DLC (cp-tc-prod) Spark tasks take
-2-7 minutes for the first query after idle (session/cluster cold start);
-Databricks (cp-azure-prod) warehouse cold start is similar. This is normal —
-the CLI prints "Executing on <ds> (timeout Ns...)" and then blocks.
-
-- Per-request timeout: env `DBEAVER_REST_TIMEOUT` in seconds (default 600).
-  On timeout the CLI exits 1 with a clear message; the query may STILL be
-  running server-side in DBeaver (check the DBeaver UI before retrying
-  heavy statements).
-- Do NOT Ctrl-C a slow sql call and assume it failed — just wait, or rerun
-  with a higher `DBEAVER_REST_TIMEOUT`. For interactive agent runs, set the
-  tool/shell timeout above 600s or run the command in a background session
-  and poll.
-- After the first query warms the engine, subsequent queries on the same
-  connection are fast (seconds).
-
 Examples:
 ```bash
 dbeaver-cli sql cp-tc-prod "SHOW DATABASES" 50
@@ -63,23 +44,6 @@ dbeaver-cli sql cp-azure-prod "SELECT * FROM samples.nyctaxi.trips LIMIT 5"
 dbeaver-cli sql cp-tc-prod "INSERT INTO t VALUES (1)"   # DML returns updateCount
 dbeaver-cli sql cp-tc-prod -f report.sql 500            # multi-line file; maxRows is arg AFTER the file
 ```
-
-## DLC (cp-tc-prod) gotchas
-
-DLC tables are Spark v2 tables; the DLC JDBC gateway does not return output
-for some utility commands:
-- `DESCRIBE` / `DESC` work because the DLC connector plugin
-  (com.tencent.dbeaver.ext.dlc, repo ~/Documents/x/tencent-dlc-sts-connector)
-  rewrites them to an `information_schema.columns` SELECT
-  (`DlcQueryRewriter`). The rewrite covers plain AND prepared statements;
-  if DESCRIBE ever returns a single empty `result` column again, that
-  connector's prepared-statement path has regressed.
-- `SHOW CREATE TABLE` succeeds server-side but returns a single empty
-  `result` column (0 rows); `SHOW COLUMNS` fails with
-  `[NOT_SUPPORTED_COMMAND_FOR_V2_TABLE]`.
-- `SHOW DATABASES` / `SHOW TABLES [IN db]` work normally.
-- Manual schema inspection alternative: `select * from db.table limit 1`
-  with `--json` and read the `columns` metadata (name/typeName/dataKind).
 
 ## Response shapes (raw JSON via --json or curl)
 
@@ -98,6 +62,25 @@ for some utility commands:
 - Read-only SQL (SELECT/SHOW/DESCRIBE) may run directly. For mutating
   statements (INSERT/UPDATE/DELETE/DROP/ALTER/CREATE), show the SQL and get
   explicit user approval first.
+- **Stop immediately on credential errors — no fallbacks.** If a `connect` or
+  `sql` call fails with an authentication error — e.g. "Login failed",
+  "Access denied", "ORA-01017: invalid username/password",
+  "Authentication failed", "SQLState: 28000", driver 401/403 errors, or the
+  Databricks JDBC `403 Forbidden` on `TOpenSessionReq` — then:
+  1. **Do not retry**, and do not retry variants of the SQL.
+  2. **Do not try another DBeaver connection** as a workaround.
+  3. **Do not fall back to a different client or CLI.** Swapping tools does not
+     fix an expired credential — it just moves the query to a session the user
+     is not watching, and returns a result whose provenance differs from the
+     connection they asked for. This applies to `databricks` CLI,
+     `tccli`/`tdlc`, `spark-sql`, `curl` against the API, or any other route to
+     the same server.
+
+  Report the exact error to the user and ask them to refresh the credential in
+  the DBeaver connection config (or grant the login on the database side), then
+  retry only after they confirm — even if another tool would work right now.
+  If a fallback path seems genuinely necessary, ask first rather than
+  substituting it silently.
 - Always pass a sane row limit for exploratory queries (e.g. `dbeaver-cli sql ds "..." 100`).
   Table output marks truncation with "TRUNCATED at maxRows"; with --json check the `truncated` flag
   before claiming results are complete.
